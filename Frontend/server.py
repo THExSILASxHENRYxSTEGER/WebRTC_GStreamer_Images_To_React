@@ -1,108 +1,81 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from typing import Dict, Set
+from typing import Dict, Set, List
+import asyncio
 
 app = FastAPI()
 
-# peer_id -> websocket
 clients: Dict[int, WebSocket] = {}
+registrations: Dict[int, Set[int]] = {}
+pending: Dict[int, List[dict]] = {}  # target_id -> queued messages
 
-# websocket -> set(peer_ids)
-registrations: Dict[WebSocket, Set[int]] = {}
-
+async def deliver(target_id: int, data: dict):
+    if target_id in clients:
+        try:
+            await clients[target_id].send_json(data)
+            return True
+        except Exception:
+            pass
+    # queue it
+    pending.setdefault(target_id, []).append(data)
+    print(f"QUEUED {data.get('type')} for {target_id}")
+    return False
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-
-    print("New websocket connected")
-
-    registrations[ws] = set()
+    ws_id = id(ws)
+    registrations[ws_id] = set()
+    print("WS connected")
 
     try:
         while True:
             data = await ws.receive_json()
-
             msg_type = data.get("type")
-            peer_id = data.get("id")
+            peer_id  = data.get("id")
 
-            #
-            # Registration message
-            #
             if msg_type == "register":
-
                 if peer_id is None:
                     continue
-
                 clients[peer_id] = ws
-                registrations[ws].add(peer_id)
+                registrations[ws_id].add(peer_id)
+                print(f"Registered {peer_id}")
 
-                print(f"Registered peer {peer_id}")
-
+                # flush any queued messages for this peer
+                if peer_id in pending:
+                    print(f"Flushing {len(pending[peer_id])} queued messages to {peer_id}")
+                    for queued in pending.pop(peer_id):
+                        try:
+                            await ws.send_json(queued)
+                        except Exception:
+                            pass
                 continue
 
-            #
-            # Ignore malformed packets
-            #
             if peer_id is None:
                 continue
 
-            #
-            # If a peer wasn't explicitly registered,
-            # register it automatically.
-            #
             if peer_id not in clients:
                 clients[peer_id] = ws
-                registrations[ws].add(peer_id)
+                registrations[ws_id].add(peer_id)
+                print(f"Auto-registered {peer_id}")
 
-                print(f"Auto-registered peer {peer_id}")
-
-            #
-            # Directed packet
-            #
             target = data.get("target_id")
 
             if target is not None:
-
-                if target in clients:
-
-                    print(
-                        f"{peer_id} -> {target} ({msg_type})"
-                    )
-
-                    await clients[target].send_json(data)
-
-                else:
-
-                    print(
-                        f"Dropping {msg_type}: target {target} not connected"
-                    )
-
+                print(f"{peer_id} -> {target} ({msg_type})")
+                await deliver(target, data)
                 continue
 
-            #
-            # Broadcast (typically Answer / ICE from browser)
-            #
             for pid, client in list(clients.items()):
-
-                if pid == peer_id:
-                    continue
-
-                try:
-                    await client.send_json(data)
-                except Exception:
-                    pass
+                if pid != peer_id:
+                    try:
+                        await client.send_json(data)
+                    except Exception:
+                        pass
 
     except WebSocketDisconnect:
-
-        print("Websocket disconnected")
-
+        print("WS disconnected")
     finally:
-
-        #
-        # Remove every peer owned by this websocket
-        #
-        ids = registrations.pop(ws, set())
-
+        ids = registrations.pop(ws_id, set())
         for pid in ids:
             clients.pop(pid, None)
-            print(f"Removed peer {pid}")
+            print(f"Removed {pid}")

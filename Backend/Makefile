@@ -2,7 +2,7 @@
 CXX := g++
 
 # Flags
-CXXFLAGS := -std=c++17 -Wall -Wextra -pthread -g
+CXXFLAGS := -std=c++17 -Wall -Wextra -pthread -g -DGST_USE_UNSTABLE_API
 
 # Separate compilation flags (--cflags) from linker flags (--libs)
 GST_CFLAGS    := $(shell pkg-config --cflags gstreamer-1.0 gstreamer-webrtc-1.0 gstreamer-sdp-1.0 gstreamer-app-1.0)

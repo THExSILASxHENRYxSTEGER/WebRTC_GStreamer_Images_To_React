@@ -11,44 +11,10 @@ static void post(GMainContext* ctx, GSourceFunc fn, gpointer data)
     g_source_unref(src);
 }
 
-static gboolean cb_add_transceiver(gpointer data)
-{
-    auto* self = static_cast<WebRTCStreamer*>(data);
-    std::cout << "[Stream " << self->id_ << "] add-transceiver\n";
-
-    // Re-acquire webrtc_ now that pipeline is confirmed PLAYING
-    if (self->webrtc_)
-    {
-        gst_object_unref(self->webrtc_);
-        self->webrtc_ = nullptr;
-    }
-
-    self->webrtc_ = gst_bin_get_by_name(GST_BIN(self->pipeline_), "webrtc");
-
-    if (!self->webrtc_)
-    {
-        std::cerr << "[Stream " << self->id_ << "] webrtc_ null after PLAYING\n";
-        return G_SOURCE_REMOVE;
-    }
-
-    GstWebRTCRTPTransceiver* trans = nullptr;
-    g_signal_emit_by_name(
-        self->webrtc_,
-        "add-transceiver",
-        GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY,
-        nullptr,
-        &trans
-    );
-
-    if (trans) gst_object_unref(trans);
-
-    return G_SOURCE_REMOVE;
-}
-
 static gboolean cb_create_offer(gpointer data)
 {
     auto* self = static_cast<WebRTCStreamer*>(data);
-    std::cout << "[Stream " << self->id_ << "] negotiation-needed -> create_offer\n";
+    std::cout << "[Stream " << self->id_ << "] create_offer\n";
     self->create_offer();
     return G_SOURCE_REMOVE;
 }
@@ -65,11 +31,22 @@ static gboolean cb_bus_watch(GstBus*, GstMessage* msg, gpointer data)
             {
                 GstState old_state, new_state, pending;
                 gst_message_parse_state_changed(msg, &old_state, &new_state, &pending);
+                std::cout << "[Stream " << self->id_ << "] state "
+                          << gst_element_state_get_name(old_state) << " -> "
+                          << gst_element_state_get_name(new_state) << "\n";
 
-                if (new_state == GST_STATE_PLAYING && !self->transceiver_added_)
+                if (new_state == GST_STATE_PLAYING && !self->offer_created_)
                 {
-                    self->transceiver_added_ = true;
-                    post(self->ctx_, cb_add_transceiver, self);
+                    self->offer_created_ = true;
+                    // Re-acquire webrtc_ now pipeline is fully up
+                    if (self->webrtc_) { gst_object_unref(self->webrtc_); }
+                    self->webrtc_ = gst_bin_get_by_name(GST_BIN(self->pipeline_), "webrtc");
+                    if (!self->webrtc_) {
+                        std::cerr << "[Stream " << self->id_ << "] webrtc_ null at PLAYING\n";
+                        break;
+                    }
+                    std::cout << "[Stream " << self->id_ << "] PLAYING -> posting create_offer\n";
+                    post(self->ctx_, cb_create_offer, self);
                 }
             }
             break;
@@ -92,10 +69,13 @@ static gboolean cb_bus_watch(GstBus*, GstMessage* msg, gpointer data)
 static void on_negotiation_needed(GstElement*, gpointer user_data)
 {
     auto* self = static_cast<WebRTCStreamer*>(user_data);
-    post(self->ctx_, cb_create_offer, self);
+    std::cout << "[Stream " << self->id_ << "] on-negotiation-needed\n";
+    if (!self->offer_created_)
+    {
+        self->offer_created_ = true;
+        post(self->ctx_, cb_create_offer, self);
+    }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
 
 WebRTCStreamer::WebRTCStreamer(
     std::shared_ptr<SignalingClient> sc,
@@ -107,6 +87,8 @@ WebRTCStreamer::WebRTCStreamer(
 {
     std::cout << "[Stream " << id_ << "] Constructor start\n";
 
+    // Use a pipeline that links rtph264pay directly into webrtcbin.
+    // webrtcbin will auto-create a transceiver when the pad is linked.
     std::string pipeline_desc =
         "appsrc name=src is-live=true format=time "
         "caps=video/x-raw,format=BGRx,width=1280,height=720,framerate=30/1 "
@@ -115,7 +97,8 @@ WebRTCStreamer::WebRTCStreamer(
         "! x264enc tune=zerolatency speed-preset=ultrafast key-int-max=30 "
         "! rtph264pay config-interval=1 pt=96 "
         "! application/x-rtp,media=video,encoding-name=H264,payload=96 "
-        "! webrtcbin name=webrtc stun-server=stun.l.google.com:19302";
+        "! webrtcbin name=webrtc bundle-policy=max-bundle "
+        "  stun-server=stun://stun.l.google.com:19302";
 
     GError* error = nullptr;
     pipeline_ = gst_parse_launch(pipeline_desc.c_str(), &error);
@@ -172,7 +155,6 @@ void WebRTCStreamer::start_send()
     ctx_  = g_main_context_new();
     loop_ = g_main_loop_new(ctx_, FALSE);
 
-    // Attach bus watch explicitly to ctx_
     GstBus* bus = gst_element_get_bus(pipeline_);
     GSource* bus_src = gst_bus_create_watch(bus);
     gst_object_unref(bus);
@@ -182,7 +164,6 @@ void WebRTCStreamer::start_send()
     g_source_attach(bus_src, ctx_);
     g_source_unref(bus_src);
 
-    // Block until loop thread owns ctx_ and is running
     std::mutex mtx;
     std::condition_variable cv;
     bool running = false;
@@ -190,22 +171,17 @@ void WebRTCStreamer::start_send()
     loop_thread_ = std::thread([this, &mtx, &cv, &running]()
     {
         g_main_context_push_thread_default(ctx_);
-
         { std::lock_guard<std::mutex> lk(mtx); running = true; }
         cv.notify_one();
-
         std::cout << "[Stream " << id_ << "] GLib loop starting\n";
         g_main_loop_run(loop_);
         std::cout << "[Stream " << id_ << "] GLib loop exited\n";
-
         g_main_context_pop_thread_default(ctx_);
     });
 
     { std::unique_lock<std::mutex> lk(mtx);
       cv.wait(lk, [&running]{ return running; }); }
 
-    // Set PLAYING — cb_bus_watch will trigger add-transceiver
-    // once it sees GST_STATE_PLAYING on the pipeline
     std::cout << "[Stream " << id_ << "] setting PLAYING\n";
     gst_element_set_state(pipeline_, GST_STATE_PLAYING);
 
@@ -214,7 +190,7 @@ void WebRTCStreamer::start_send()
 
 void WebRTCStreamer::create_offer()
 {
-    std::cout << "[Stream " << id_ << "] create_offer\n";
+    std::cout << "[Stream " << id_ << "] create_offer emit\n";
     GstPromise* promise = gst_promise_new_with_change_func(
         on_offer_created, this, nullptr);
     g_signal_emit_by_name(webrtc_, "create-offer", nullptr, promise);
@@ -261,7 +237,7 @@ void WebRTCStreamer::on_ice_candidate(
     nlohmann::json msg = {
         {"type", "ice"}, {"candidate", candidate},
         {"sdpMLineIndex", mline}, {"id", self->id_},
-        {"target_id", 100 + self->id_}
+        {"target_id", self->id_ + 100}
     };
     self->sc_->send(msg.dump());
 }
@@ -271,22 +247,31 @@ void WebRTCStreamer::on_offer_created(GstPromise* promise, gpointer user_data)
     auto* self = static_cast<WebRTCStreamer*>(user_data);
 
     const GstStructure* reply = gst_promise_get_reply(promise);
-    if (!reply) return;
+    if (!reply) { gst_promise_unref(promise); return; }
 
     GstWebRTCSessionDescription* offer = nullptr;
     gst_structure_get(reply, "offer",
         GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, nullptr);
+
+    if (!offer) {
+        std::cerr << "[Stream " << self->id_ << "] offer is null\n";
+        gst_promise_unref(promise);
+        return;
+    }
 
     GstPromise* lp = gst_promise_new();
     g_signal_emit_by_name(self->webrtc_, "set-local-description", offer, lp);
     gst_promise_interrupt(lp);
     gst_promise_unref(lp);
 
+    self->ready_ = true;
+
     gchar* sdp_text = gst_sdp_message_as_text(offer->sdp);
+    std::cout << "[Stream " << self->id_ << "] offer created, sending\n";
 
     nlohmann::json msg = {
         {"type", "offer"}, {"sdp", sdp_text},
-        {"id", self->id_}, {"target_id", 100 + self->id_}
+        {"id", self->id_}, {"target_id", self->id_ + 100}
     };
     self->sc_->send(msg.dump());
 
@@ -297,11 +282,11 @@ void WebRTCStreamer::on_offer_created(GstPromise* promise, gpointer user_data)
 
 void WebRTCStreamer::push_frame(const cv::Mat& frame)
 {
+    if (!ready_ || !appsrc_) return;
+
     static int count = 0;
     if (++count == 1)
         std::cout << "[Stream " << id_ << "] first frame pushed\n";
-
-    if (!appsrc_) return;
 
     const GstClockTime duration = gst_util_uint64_scale_int(1, GST_SECOND, 30);
     const size_t size = frame.total() * frame.elemSize();
@@ -339,7 +324,6 @@ WebRTCStreamer::~WebRTCStreamer()
     }
 
     if (webrtc_) { gst_object_unref(webrtc_); webrtc_ = nullptr; }
-
     if (loop_) g_main_loop_quit(loop_);
     if (loop_thread_.joinable()) loop_thread_.join();
     if (loop_) { g_main_loop_unref(loop_); loop_ = nullptr; }

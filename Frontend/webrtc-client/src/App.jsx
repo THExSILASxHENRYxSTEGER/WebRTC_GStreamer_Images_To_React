@@ -1,168 +1,176 @@
 import { useEffect, useRef, useState } from "react";
 
-function useWebRTC(ws, viewerId, videoRef) {
+function VideoStream({ cppId, browserId, ws }) {
+  const videoRef     = useRef(null);
+  const pcRef         = useRef(null);
+  const streamRef      = useRef(null);
+  const pendingIceRef  = useRef([]);   // ICE candidates that arrive before remote desc is set
+  const remoteSetRef   = useRef(false);
+
+  const setVideoRef = (el) => {
+    videoRef.current = el;
+    if (el && streamRef.current) {
+      el.srcObject = streamRef.current;
+    }
+  };
+
   useEffect(() => {
     if (!ws) return;
 
-    const pc = new RTCPeerConnection({
-      iceServers: [
-        {
-          urls: "stun:stun.l.google.com:19302",
-        },
-      ],
-    });
+    if (pcRef.current) { pcRef.current.close(); pcRef.current = null; }
+    remoteSetRef.current = false;
+    pendingIceRef.current = [];
 
-    console.log(`[${viewerId}] PeerConnection created`);
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+    });
+    pcRef.current = pc;
 
     pc.ontrack = (event) => {
-      console.log(`[${viewerId}] TRACK received`);
-
+      console.log(`[${browserId}] TRACK kind=${event.track.kind}`);
+      const stream = event.streams[0];
+      streamRef.current = stream;
       if (videoRef.current) {
-        videoRef.current.srcObject = event.streams[0];
+        videoRef.current.srcObject = stream;
       }
-    };
-
-    pc.onconnectionstatechange = () => {
-      console.log(
-        `[${viewerId}] state =`,
-        pc.connectionState
-      );
     };
 
     pc.onicecandidate = (event) => {
       if (!event.candidate) return;
+      console.log(`[${browserId}] candidate type:`, event.candidate.type, event.candidate.candidate);
+      ws.send(JSON.stringify({
+        type: "ice",
+        id: browserId,
+        target_id: cppId,
+        candidate: event.candidate.candidate,
+        sdpMLineIndex: event.candidate.sdpMLineIndex,
+      }));
+    };
 
-      console.log(`[${viewerId}] sending ICE`);
+    pc.onconnectionstatechange = () =>
+      console.log(`[${browserId}] conn: ${pc.connectionState}`);
 
-      ws.send(
-        JSON.stringify({
-          id: viewerId,
-          type: "ice",
-          candidate: event.candidate.candidate,
-          sdpMLineIndex: event.candidate.sdpMLineIndex,
-        })
-      );
+    pc.oniceconnectionstatechange = async () => {
+      console.log(`[${browserId}] ICE: ${pc.iceConnectionState}`);
+      if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+        const stats = await pc.getStats();
+        stats.forEach(report => {
+          if (report.type === "candidate-pair" && report.state) {
+            console.log(`[${browserId}] candidate-pair state=${report.state}`, report);
+          }
+        });
+      }
+    };
+
+    const flushPendingIce = async () => {
+      const queued = pendingIceRef.current;
+      pendingIceRef.current = [];
+      for (const cand of queued) {
+        try {
+          await pc.addIceCandidate(cand);
+        } catch (e) {
+          console.error(`[${browserId}] flush ICE error:`, e);
+        }
+      }
     };
 
     const handleMessage = async (event) => {
-      const msg = JSON.parse(event.data);
-
-      console.log(`[${viewerId}] RX`, msg);
+      let msg;
+      try { msg = JSON.parse(event.data); } catch { return; }
+      if (msg.target_id !== browserId) return;
 
       try {
-        // OFFER → from backend (GStreamer)
-        if (msg.type === "offer" && msg.target_id === viewerId) {
-          console.log(`[${viewerId}] setting remote OFFER`);
-
-          await pc.setRemoteDescription({
-            type: "offer",
-            sdp: msg.sdp,
-          });
+        if (msg.type === "offer") {
+          await pc.setRemoteDescription(
+            new RTCSessionDescription({ type: "offer", sdp: msg.sdp })
+          );
+          remoteSetRef.current = true;
+          await flushPendingIce();
 
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
-
-          ws.send(
-            JSON.stringify({
-              id: viewerId,
-              target_id: msg.id, // reply to sender
-              type: "answer",
-              sdp: answer.sdp,
-            })
-          );
-
-          console.log(`[${viewerId}] ANSWER sent`);
+          ws.send(JSON.stringify({
+            type: "answer", id: browserId, target_id: cppId, sdp: answer.sdp,
+          }));
+          console.log(`[${browserId}] answer sent`);
         }
 
-        // ANSWER → rarely needed here but safe
-        if (msg.type === "answer" && msg.target_id === viewerId) {
-          console.log(`[${viewerId}] setting remote ANSWER`);
-
-          await pc.setRemoteDescription({
-            type: "answer",
-            sdp: msg.sdp,
-          });
-        }
-
-        // ICE → both directions
-        if (msg.type === "ice" && msg.target_id === viewerId) {
-          console.log(`[${viewerId}] adding ICE`);
-
-          await pc.addIceCandidate({
+        if (msg.type === "ice" && msg.candidate) {
+          const cand = new RTCIceCandidate({
             candidate: msg.candidate,
             sdpMLineIndex: msg.sdpMLineIndex,
           });
+          if (remoteSetRef.current) {
+            await pc.addIceCandidate(cand);
+          } else {
+            // remote description not set yet — queue it
+            pendingIceRef.current.push(cand);
+          }
         }
-      } catch (err) {
-        console.error(`[${viewerId}] WebRTC error`, err);
+      } catch (e) {
+        console.error(`[${browserId}] error:`, e);
       }
     };
 
     ws.addEventListener("message", handleMessage);
-
     return () => {
       ws.removeEventListener("message", handleMessage);
       pc.close();
+      pcRef.current = null;
     };
-  }, [ws, viewerId, videoRef]);
+  }, [ws]);
+
+  return (
+    <div>
+      <p style={{ margin: "0 0 4px" }}>Stream {cppId}</p>
+      <video
+        ref={setVideoRef}
+        autoPlay
+        playsInline
+        muted
+        style={{ width: 640, height: 360, background: "#000", display: "block" }}
+      />
+    </div>
+  );
 }
 
 export default function App() {
   const [ws, setWs] = useState(null);
-
-  const video100 = useRef(null);
-  const video101 = useRef(null);
+  const socketRef    = useRef(null);
 
   useEffect(() => {
+    if (socketRef.current) return;
+
     const socket = new WebSocket("ws://localhost:8000/ws");
+    socketRef.current = socket;
 
     socket.onopen = () => {
-      console.log("WebSocket connected");
-
-      // register both peers
-      socket.send(JSON.stringify({ type: "register", id: 100 }));
-      socket.send(JSON.stringify({ type: "register", id: 101 }));
-
+      console.log("WS open");
+      socket.send(JSON.stringify({ type: "register", id: 200 }));
+      socket.send(JSON.stringify({ type: "register", id: 201 }));
       setWs(socket);
     };
 
+    socket.onerror = (e) => console.error("WS error", e);
     socket.onclose = () => {
-      console.log("WebSocket closed");
+      console.log("WS closed");
+      socketRef.current = null;
+      setWs(null);
     };
 
-    socket.onerror = (e) => {
-      console.error("WebSocket error", e);
+    return () => {
+      socket.close();
+      socketRef.current = null;
     };
-
-    return () => socket.close();
   }, []);
 
-  useWebRTC(ws, 100, video100);
-  useWebRTC(ws, 101, video101);
-
   return (
-    <div style={{ padding: 20 }}>
+    <div style={{ fontFamily: "sans-serif", padding: 20 }}>
       <h2>WebRTC Viewer</h2>
-
-      <video
-        ref={video100}
-        autoPlay
-        playsInline
-        muted
-        style={{ width: 800, background: "black", display: "block" }}
-      />
-
-      <video
-        ref={video101}
-        autoPlay
-        playsInline
-        muted
-        style={{
-          width: 800,
-          background: "black",
-          marginTop: 20,
-        }}
-      />
+      <div style={{ display: "flex", gap: 16 }}>
+        <VideoStream ws={ws} cppId={100} browserId={200} />
+        <VideoStream ws={ws} cppId={101} browserId={201} />
+      </div>
     </div>
   );
 }

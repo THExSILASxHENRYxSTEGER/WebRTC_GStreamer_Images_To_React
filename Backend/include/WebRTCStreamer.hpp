@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -16,17 +17,17 @@ namespace routing {
     class WebRTCStreamer
     {
         public:
-            
             WebRTCStreamer(std::shared_ptr<SignalingClient> websocket, int id);
             ~WebRTCStreamer();
 
             // public so free static callbacks in .cpp can access them
-            GstElement*   webrtc_           = nullptr;
-            GstElement*   pipeline_         = nullptr;
-            GMainContext* ctx_              = nullptr;
-            int           id_              = 0;
-            bool          transceiver_added_ = false;
-            
+            GstElement*   webrtc_       = nullptr;
+            GstElement*   pipeline_     = nullptr;
+            GMainContext* ctx_          = nullptr;
+            int           id_           = 0;
+            bool          offer_created_ = false;
+            std::atomic<bool> ready_   = false;
+
             void start_send();
             void create_offer();
             void handle_message(const nlohmann::json& doc);
